@@ -3,6 +3,9 @@ from __future__ import annotations
 from typing import List, Optional
 
 from pydantic import ValidationError
+import git
+from pathlib import Path
+from sortedcontainers import SortedDict
 
 from langchain.chains.llm import LLMChain
 from langchain.chat_models.base import BaseChatModel
@@ -41,11 +44,20 @@ class AutoGPT:
         self.ai_name = ai_name
         self.memory = memory
         self.full_message_history: List[BaseMessage] = []
+        self.commit_history: SortedDict[int, git.Commit] = {}
         self.next_action_count = 0
         self.chain = chain
         self.output_parser = output_parser
         self.tools = tools
         self.feedback_tool = feedback_tool
+
+        # make sure the path is the same as the one in BaseFileToolMixin
+        self._root_dir = Path("workspace").resolve()
+        self._root_dir.mkdir(exist_ok=True, parents=True)
+        with open('workspace/test.txt', 'w') as f:
+            pass
+        self._git = git.Repo.init(self._root_dir, bare=False)
+        self.add_git_checkpoint('master commit')
 
     @classmethod
     def from_llm_and_tools(
@@ -67,6 +79,7 @@ class AutoGPT:
         )
         human_feedback_tool = HumanInputRun() if human_in_the_loop else None
         chain = LLMChain(llm=llm, prompt=prompt)
+
         return cls(
             ai_name,
             memory,
@@ -75,6 +88,42 @@ class AutoGPT:
             tools,
             feedback_tool=human_feedback_tool,
         )
+    
+    def reset_to_checkpoint(self, index):
+        if index <= 0:
+            # key 0 should always exist.... TODO make this better
+            cid = self.commit_history.get(0)
+            self._git.git.checkout(cid)
+            self.full_message_history.clear()
+            self.commit_history.clear()
+            return
+
+        # Remove items up to and including the checkpointed index
+
+        idx, cid = self.commit_history.popitem()
+        while idx > index:
+            idx, cid = self.commit_history.popitem()
+
+        self.full_message_history = self.full_message_history[:idx-1]
+
+        self._git.git.checkout(cid)
+
+    def add_git_checkpoint(self, commit_message, branch=None):
+            cid = None
+            if commit_message is None:
+                commit_message = 'checkpoint'
+            if branch is not None and branch.strip() != '':
+                branches = self._git.git.branch("--all").split()
+                if branch not in branches:
+                    self._git.git.branch(branch)
+                self._git.git.checkout(branch)
+            if self._git.is_dirty(untracked_files=True):
+                self._git.git.add('--all')
+                cid = self._git.git.commit('-am', commit_message)
+            else:
+                cid = self._git.head.commit
+            return cid
+
 
     def run(self, goals: List[str]) -> str:
         user_input = (
@@ -83,10 +132,16 @@ class AutoGPT:
         )
         # Interaction Loop
         loop_count = 0
+        # add initial checkpoint. Switch to this loop's branch
+        self.add_git_checkpoint('initial checkpoint', self.ai_name)
         while True:
             # Discontinue if continuous limit is reached
             loop_count += 1
+            # assume we're already on the correct branch?
+            cid = self.add_git_checkpoint('start loop ' + str(loop_count))
+            self.commit_history[len(self.full_message_history)] = cid
 
+            # will chain.run try to modify the message history? Lets hope not
             # Send message to AI, get response
             assistant_reply = self.chain.run(
                 goals=goals,
@@ -130,12 +185,33 @@ class AutoGPT:
             memory_to_add = (
                 f"Assistant Reply: {assistant_reply} " f"\nResult: {result} "
             )
+
+            # assume we're already on the correct branch?
+            # need to do this in case a file was already written..
+            self.add_git_checkpoint('mid loop ' + str(loop_count))
+            #self.commit_history[len(self.full_message_history)] = cid
+
             if self.feedback_tool is not None:
-                feedback = f"\n{self.feedback_tool.run('Input: ')}"
+                feedback = f"{self.feedback_tool.run('Input: ')}"
                 if feedback in {"q", "stop"}:
                     print("EXITING")
                     return "EXITING"
-                memory_to_add += feedback
+                elif feedback == "revert":
+                    # The only valid revert points are the ones at the beginning
+                    # of each loop. We will actually revert to 1 step before the
+                    # actual checkpoint, which will get re-added at the beginning
+                    # of the next loop iteration
+                    keys = list(self.commit_history.keys())
+                    for i in range(len(keys)):
+                        message = '**full reset**'
+                        if i > 0:
+                            message = self.full_message_history[keys[i] - 1].content
+                        print("{0}: {1}".format(i, message))
+                    feedback = f"{self.feedback_tool.run('Index: ')}"
+                    idx = keys[int(feedback)]
+                    self.reset_to_checkpoint(idx)
+                    continue
+                memory_to_add += '\n'+feedback
 
             self.memory.add_documents([Document(page_content=memory_to_add)])
             self.full_message_history.append(SystemMessage(content=result))

@@ -30,7 +30,7 @@ class FileValidationError(ValueError):
 class BaseFileToolMixin(BaseModel):
     """Mixin for file system tools."""
 
-    root_dir: Optional[str] = None
+    root_dir: Optional[str] = "workspace"
     """The final path will be chosen relative to root_dir if specified."""
 
     def get_relative_path(self, file_path: str) -> Path:
@@ -38,8 +38,7 @@ class BaseFileToolMixin(BaseModel):
         if self.root_dir is None:
             return Path(file_path)
         return get_validated_relative_path(Path(self.root_dir), file_path)
-
-
+    
 def get_validated_relative_path(root: Path, user_path: str) -> Path:
     """Resolve a relative path, raising an error if not within the root directory."""
     # Note, this still permits symlinks from outside that point within the root.
