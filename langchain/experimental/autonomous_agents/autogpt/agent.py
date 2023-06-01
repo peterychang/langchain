@@ -28,6 +28,9 @@ from langchain.tools.base import BaseTool
 from langchain.tools.human.tool import HumanInputRun
 from langchain.vectorstores.base import VectorStoreRetriever
 
+import copy
+import networkx as nx
+import matplotlib.pyplot as plt
 
 class AutoGPT:
     """Agent class for interacting with Auto-GPT."""
@@ -44,7 +47,10 @@ class AutoGPT:
         self.ai_name = ai_name
         self.memory = memory
         self.full_message_history: List[BaseMessage] = []
-        self.commit_history: SortedDict[int, git.Commit] = {}
+        self.commit_history: SortedDict[int, (git.Commit, List[BaseMessage], VectorStoreRetriever)] = {}
+        # Graph key: "revert_count-loop_count"
+        self.run_history = nx.DiGraph()
+
         self.next_action_count = 0
         self.chain = chain
         self.output_parser = output_parser
@@ -92,20 +98,21 @@ class AutoGPT:
     def reset_to_checkpoint(self, index):
         if index <= 0:
             # key 0 should always exist.... TODO make this better
-            cid = self.commit_history.get(0)
+            (cid, msg_history, memory) = self.commit_history.get(0)
             self._git.git.checkout(cid)
-            self.full_message_history.clear()
+            self.full_message_history = copy.deepcopy(msg_history)
+            self.memory = copy.deepcopy(memory)
             self.commit_history.clear()
             return
 
         # Remove items up to and including the checkpointed index
 
-        idx, cid = self.commit_history.popitem()
+        idx, (cid, msg_history, memory) = self.commit_history.popitem()
         while idx > index:
-            idx, cid = self.commit_history.popitem()
+            idx, (cid, msg_history, memory) = self.commit_history.popitem()
 
-        self.full_message_history = self.full_message_history[:idx-1]
-
+        self.full_message_history = copy.deepcopy(msg_history)
+        self.memory = copy.deepcopy(memory)
         self._git.git.checkout(cid)
 
     def add_git_checkpoint(self, commit_message, branch=None):
@@ -132,14 +139,24 @@ class AutoGPT:
         )
         # Interaction Loop
         loop_count = 0
+        revert_count = 0
         # add initial checkpoint. Switch to this loop's branch
         self.add_git_checkpoint('initial checkpoint', self.ai_name)
+        # create root node
+        prev_node_name = "{0}-{1}".format(revert_count, loop_count)
+        self.run_history.add_node(prev_node_name)
         while True:
             # Discontinue if continuous limit is reached
             loop_count += 1
             # assume we're already on the correct branch?
-            cid = self.add_git_checkpoint('start loop ' + str(loop_count))
-            self.commit_history[len(self.full_message_history)] = cid
+            current_node_name = "{0}-{1}".format(revert_count, loop_count)
+            cid = self.add_git_checkpoint("start " + current_node_name)
+            self.commit_history[len(self.full_message_history)] = (cid, copy.deepcopy(self.full_message_history), copy.deepcopy(self.memory))
+
+            self.run_history.add_node(current_node_name, data=copy.deepcopy(self.commit_history))
+            self.run_history.add_edge(prev_node_name, current_node_name)
+            prev_node_name = current_node_name
+            #nx.drawing.nx_agraph.write_dot(self.run_history, "graph.dot")
 
             # will chain.run try to modify the message history? Lets hope not
             # Send message to AI, get response
@@ -196,7 +213,7 @@ class AutoGPT:
                 if feedback in {"q", "stop"}:
                     print("EXITING")
                     return "EXITING"
-                elif feedback == "revert":
+                elif feedback in {"revert", "r", "reset"}:
                     # The only valid revert points are the ones at the beginning
                     # of each loop. We will actually revert to 1 step before the
                     # actual checkpoint, which will get re-added at the beginning
@@ -208,7 +225,19 @@ class AutoGPT:
                             message = self.full_message_history[keys[i] - 1].content
                         print("{0}: {1}".format(i, message))
                     feedback = f"{self.feedback_tool.run('Index: ')}"
-                    idx = keys[int(feedback)]
+                    feedback = int(feedback)
+                    loop_count = feedback
+                    revert_count += 1
+                    counter = 1
+                    prev_node_name = "{0}-{1}".format(revert_count-counter, loop_count)
+                    while not self.run_history.has_node(prev_node_name):
+                        counter += 1
+                        prev_node_name = "{0}-{1}".format(revert_count-counter, loop_count)
+                        if counter > revert_count:
+                            # This shouldn't ever happen..
+                            raise
+                    
+                    idx = keys[feedback]
                     self.reset_to_checkpoint(idx)
                     continue
                 memory_to_add += '\n'+feedback
