@@ -30,7 +30,8 @@ from langchain.vectorstores.base import VectorStoreRetriever
 
 import copy
 import networkx as nx
-import matplotlib.pyplot as plt
+import uuid
+from colorama import Fore, Style
 
 class AutoGPT:
     """Agent class for interacting with Auto-GPT."""
@@ -47,9 +48,10 @@ class AutoGPT:
         self.ai_name = ai_name
         self.memory = memory
         self.full_message_history: List[BaseMessage] = []
-        self.commit_history: SortedDict[int, (git.Commit, List[BaseMessage], VectorStoreRetriever)] = {}
+        self.commit_history: SortedDict[int, (str, List[BaseMessage], VectorStoreRetriever)] = {}
         # Graph key: "revert_count-loop_count"
         self.run_history = nx.DiGraph()
+        self.branch_uuid = uuid.uuid4()
 
         self.next_action_count = 0
         self.chain = chain
@@ -60,9 +62,10 @@ class AutoGPT:
         # make sure the path is the same as the one in BaseFileToolMixin
         self._root_dir = Path("workspace").resolve()
         self._root_dir.mkdir(exist_ok=True, parents=True)
-        with open('workspace/test.txt', 'w') as f:
-            pass
+        open('workspace/test.txt', 'w')
         self._git = git.Repo.init(self._root_dir, bare=False)
+        # Don't switch branches. If its already on a branch, nothing happens
+        # If a new repo was created, attempting to switch branches will raise an exception
         self.add_git_checkpoint('master commit')
 
     @classmethod
@@ -95,7 +98,9 @@ class AutoGPT:
             feedback_tool=human_feedback_tool,
         )
     
+    # This function will delete any uncommitted changes!
     def reset_to_checkpoint(self, index):
+        self._git.git.clean('-xdf')
         if index <= 0:
             # key 0 should always exist.... TODO make this better
             (cid, msg_history, memory) = self.commit_history.get(0)
@@ -140,25 +145,31 @@ class AutoGPT:
         # Interaction Loop
         loop_count = 0
         revert_count = 0
+        continuous = 0
+
+        goals_hash = hash(str(goals))
         # add initial checkpoint. Switch to this loop's branch
-        self.add_git_checkpoint('initial checkpoint', self.ai_name)
+        #self.add_git_checkpoint('initial checkpoint', branch_name)
         # create root node
         prev_node_name = "{0}-{1}".format(revert_count, loop_count)
+        branch_name = "{0}_{1}_{2}".format(self.ai_name, goals_hash, self.branch_uuid)
+        cur_branch_name = "{0}_{1}".format(branch_name, prev_node_name)
+        self.add_git_checkpoint("clean commit", branch_name)
         self.run_history.add_node(prev_node_name)
+        
         while True:
             # Discontinue if continuous limit is reached
             loop_count += 1
-            # assume we're already on the correct branch?
             current_node_name = "{0}-{1}".format(revert_count, loop_count)
-            cid = self.add_git_checkpoint("start " + current_node_name)
-            self.commit_history[len(self.full_message_history)] = (cid, copy.deepcopy(self.full_message_history), copy.deepcopy(self.memory))
+            nx.drawing.nx_agraph.write_dot(self.run_history, "workspace/graph.dot")
+            cur_branch_name = "{0}_{1}".format(branch_name, current_node_name)
+            self.add_git_checkpoint("commit", cur_branch_name)
+            self.commit_history[len(self.full_message_history)] = (cur_branch_name, copy.deepcopy(self.full_message_history), copy.deepcopy(self.memory))
 
             self.run_history.add_node(current_node_name, data=copy.deepcopy(self.commit_history))
             self.run_history.add_edge(prev_node_name, current_node_name)
             prev_node_name = current_node_name
-            #nx.drawing.nx_agraph.write_dot(self.run_history, "graph.dot")
 
-            # will chain.run try to modify the message history? Lets hope not
             # Send message to AI, get response
             assistant_reply = self.chain.run(
                 goals=goals,
@@ -176,6 +187,12 @@ class AutoGPT:
             action = self.output_parser.parse(assistant_reply)
             tools = {t.name: t for t in self.tools}
             if action.name == FINISH_NAME:
+                # Write out the last node
+                current_node_name = "end"
+                nx.drawing.nx_agraph.write_dot(self.run_history, "workspace/graph.dot")
+                cur_branch_name = "{0}_{1}".format(branch_name, current_node_name)
+                self.add_git_checkpoint("commit", cur_branch_name)
+
                 return action.args["response"]
             if action.name in tools:
                 tool = tools[action.name]
@@ -203,12 +220,7 @@ class AutoGPT:
                 f"Assistant Reply: {assistant_reply} " f"\nResult: {result} "
             )
 
-            # assume we're already on the correct branch?
-            # need to do this in case a file was already written..
-            self.add_git_checkpoint('mid loop ' + str(loop_count))
-            #self.commit_history[len(self.full_message_history)] = cid
-
-            if self.feedback_tool is not None:
+            if self.feedback_tool is not None and continuous == 0:
                 feedback = f"{self.feedback_tool.run('Input: ')}"
                 if feedback in {"q", "stop"}:
                     print("EXITING")
@@ -223,7 +235,7 @@ class AutoGPT:
                         message = '**full reset**'
                         if i > 0:
                             message = self.full_message_history[keys[i] - 1].content
-                        print("{0}: {1}".format(i, message))
+                        print(Fore.GREEN + "{}: ".format(i) + Style.RESET_ALL + message)
                     feedback = f"{self.feedback_tool.run('Index: ')}"
                     feedback = int(feedback)
                     loop_count = feedback
@@ -240,7 +252,12 @@ class AutoGPT:
                     idx = keys[feedback]
                     self.reset_to_checkpoint(idx)
                     continue
+                elif len(feedback) > 0 and feedback.split()[0] == 'c':
+                    continuous = [int(i) for i in feedback.split() if i.isdigit()][0] + 1
+                    feedback = ''
                 memory_to_add += '\n'+feedback
 
             self.memory.add_documents([Document(page_content=memory_to_add)])
             self.full_message_history.append(SystemMessage(content=result))
+            if continuous > 0:
+                continuous -= 1
