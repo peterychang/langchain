@@ -202,8 +202,8 @@ class AutoGPT:
                     node_history.commit_history)
                 cur_node_data: NodeDataHistory = self.run_history[node]
                 
+                retriever = cur_node_data.data.memory.as_retriever()
                 for doc in node_history.data.memory.docstore._dict.values():
-                    retriever = cur_node_data.data.memory.as_retriever()
                     retriever.add_documents([doc])
 
         self.load_from_node_data_history(self.run_history[final_node])
